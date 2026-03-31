@@ -34,6 +34,7 @@ class xFuserCausalWanModel(xFuserModel):
         num_frames=81,
         negative_prompt="bright colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still picture, cluttered background, three legs, many people in the background, walking backwards",
         guidance_scale=0.0,
+        flow_shift=3,
     )
     settings = ModelSettings(
         mod_value=8,
@@ -42,7 +43,6 @@ class xFuserCausalWanModel(xFuserModel):
         model_name="FastVideo/CausalWan2.2-I2V-A14B-Preview-Diffusers",
         output_name="causal_wan_i2v",
         fp8_gemm_module_list=["transformer.blocks"],
-        flow_shift=3,
         valid_tasks=["t2v", "i2v"],
     )
 
