@@ -26,14 +26,8 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 
-class xFuserLTX2AudioVideoAttnProcessor:
-
-    def __init__(self, use_parallel_attention: bool = True, gather_kv=False):
-        if use_parallel_attention:
-            self.attention_method = USP
-        else:
-            self.attention_method = attention
-        self.gather_kv = gather_kv
+class _USPSelfAttnProcessor:
+    """Video self-attention with USP. Always: no encoder, no gather, RoPE present."""
 
     def __call__(
         self,
@@ -44,22 +38,85 @@ class xFuserLTX2AudioVideoAttnProcessor:
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
 
-        if self.gather_kv:
-            encoder_hidden_states = get_sp_group().all_gather(encoder_hidden_states, dim=1)
-            key_rotary_emb = [x.contiguous() for x in key_rotary_emb]
-            key_rotary_emb = [get_sp_group().all_gather(x, dim=2) for x in key_rotary_emb]
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
 
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+        if attn.rope_type == "interleaved":
+            query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+            key = apply_interleaved_rotary_emb(key, query_rotary_emb)
+        elif attn.rope_type == "split":
+            query = apply_split_rotary_emb(query, query_rotary_emb)
+            key = apply_split_rotary_emb(key, query_rotary_emb)
 
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
+        hidden_states = USP(query, key, value, dropout_p=0.0, is_causal=False)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+class _PlainSelfAttnProcessor:
+    """Audio self-attention. Always: no encoder, no gather, RoPE present."""
+
+    def __call__(
+        self,
+        attn: "LTX2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.rope_type == "interleaved":
+            query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+            key = apply_interleaved_rotary_emb(key, query_rotary_emb)
+        elif attn.rope_type == "split":
+            query = apply_split_rotary_emb(query, query_rotary_emb)
+            key = apply_split_rotary_emb(key, query_rotary_emb)
+
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        hidden_states = attention(query, key, value, dropout_p=0.0, is_causal=False)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+class _CrossAttnProcessor:
+    """Cross-attention (text or cross-modal). Always: encoder present, no gather.
+    RoPE may or may not be present (absent for text cross-attn, present for cross-modal)."""
+
+    def __call__(
+        self,
+        attn: "LTX2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         query = attn.to_q(hidden_states)
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
@@ -70,24 +127,59 @@ class xFuserLTX2AudioVideoAttnProcessor:
         if query_rotary_emb is not None:
             if attn.rope_type == "interleaved":
                 query = apply_interleaved_rotary_emb(query, query_rotary_emb)
-                key = apply_interleaved_rotary_emb(
-                    key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
-                )
+                key = apply_interleaved_rotary_emb(key, key_rotary_emb)
             elif attn.rope_type == "split":
                 query = apply_split_rotary_emb(query, query_rotary_emb)
-                key = apply_split_rotary_emb(key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb)
+                key = apply_split_rotary_emb(key, key_rotary_emb)
 
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
-        hidden_states = self.attention_method(
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        hidden_states = attention(query, key, value, dropout_p=0.0, is_causal=False)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+class _GatherKVCrossAttnProcessor:
+    """Cross-attention with KV gather (video_to_audio). Always: encoder present, gather, RoPE present."""
+
+    def __call__(
+        self,
+        attn: "LTX2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states = get_sp_group().all_gather(encoder_hidden_states, dim=1)
+        key_rotary_emb = [x.contiguous() for x in key_rotary_emb]
+        key_rotary_emb = [get_sp_group().all_gather(x, dim=2) for x in key_rotary_emb]
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.rope_type == "interleaved":
+            query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+            key = apply_interleaved_rotary_emb(key, key_rotary_emb)
+        elif attn.rope_type == "split":
+            query = apply_split_rotary_emb(query, query_rotary_emb)
+            key = apply_split_rotary_emb(key, key_rotary_emb)
+
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        hidden_states = attention(query, key, value, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -176,12 +268,12 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         )
         for block in self.transformer_blocks:
 
-            block.attn1.processor = xFuserLTX2AudioVideoAttnProcessor()
-            block.attn2.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_attn1.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_attn2.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_to_video_attn.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.video_to_audio_attn.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False, gather_kv=True)
+            block.attn1.processor = _USPSelfAttnProcessor()
+            block.attn2.processor = _CrossAttnProcessor()
+            block.audio_attn1.processor = _PlainSelfAttnProcessor()
+            block.audio_attn2.processor = _CrossAttnProcessor()
+            block.audio_to_video_attn.processor = _CrossAttnProcessor()
+            block.video_to_audio_attn.processor = _GatherKVCrossAttnProcessor()
 
 
     def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:
@@ -341,7 +433,11 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             )
 
 
-        video_coords = self._chunk_and_pad_sequence(video_coords, sp_world_rank, sp_world_size, pad_amount, dim=2)
+        if pad_amount > 0:
+            vc_pad_shape = list(video_coords.shape)
+            vc_pad_shape[2] = pad_amount
+            video_coords = torch.cat([video_coords, torch.zeros(vc_pad_shape, dtype=video_coords.dtype, device=video_coords.device)], dim=2)
+        video_coords = torch.chunk(video_coords, sp_world_size, dim=2)[sp_world_rank]
 
         video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
 

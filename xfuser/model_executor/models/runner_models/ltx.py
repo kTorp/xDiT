@@ -65,6 +65,11 @@ class xFuserLTX2VideoModel(xFuserModel):
             torch_dtype=torch.bfloat16,
             subfolder="transformer",
         )
+        second_transformer = xFuserLTX2VideoTransformer3DWrapper.from_pretrained(
+            self.settings.model_name,
+            torch_dtype=torch.bfloat16,
+            subfolder="transformer",
+        )
         pipe = LTX2Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             transformer=transformer,
@@ -72,7 +77,7 @@ class xFuserLTX2VideoModel(xFuserModel):
         )
         second_pipe = LTX2Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
-            transformer=transformer,
+            transformer=second_transformer,
             torch_dtype=torch.bfloat16,
         )
         second_pipe.load_lora_weights(
