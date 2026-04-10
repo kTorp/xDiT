@@ -65,11 +65,6 @@ class xFuserLTX2VideoModel(xFuserModel):
             torch_dtype=torch.bfloat16,
             subfolder="transformer",
         )
-        second_transformer = xFuserLTX2VideoTransformer3DWrapper.from_pretrained(
-            self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-        )
         pipe = LTX2Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             transformer=transformer,
@@ -77,12 +72,12 @@ class xFuserLTX2VideoModel(xFuserModel):
         )
         second_pipe = LTX2Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
-            transformer=second_transformer,
+            transformer=transformer,
             torch_dtype=torch.bfloat16,
         )
-        second_pipe.load_lora_weights(
-            self.settings.model_name, adapter_name="stage_2_distilled", weight_name="ltx-2-19b-distilled-lora-384.safetensors"
-        )
+
+        self.lora_deltas = self._precompute_lora_deltas(second_pipe)
+
         latent_upsampler = LTX2LatentUpsamplerModel.from_pretrained(
             self.settings.model_name,
             subfolder="latent_upsampler",
@@ -90,13 +85,50 @@ class xFuserLTX2VideoModel(xFuserModel):
         )
         upsample_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
 
-        second_pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config( # Scheduler for the 2nd stage
+        second_pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
             pipe.scheduler.config, use_dynamic_shifting=False, shift_terminal=None
         )
         self.second_pipe = second_pipe
         self.upsample_pipe = upsample_pipe
 
         return pipe
+
+    def _precompute_lora_deltas(self, pipe: LTX2Pipeline) -> dict:
+        """Load LoRA, fuse into base weights, compute deltas, then remove LoRA entirely."""
+        pipe.load_lora_weights(
+            self.settings.model_name,
+            adapter_name="stage_2_distilled",
+            weight_name="ltx-2-19b-distilled-lora-384.safetensors",
+        )
+
+        base_weights = {
+            name: param.data.clone()
+            for name, param in pipe.transformer.named_parameters()
+        }
+
+        pipe.fuse_lora(components=["transformer"])
+        pipe.unload_lora_weights()
+
+        deltas = {}
+        for name, param in pipe.transformer.named_parameters():
+            delta = param.data - base_weights[name]
+            if delta.any():
+                deltas[name] = delta
+            param.data.copy_(base_weights[name])
+
+        del base_weights
+        log(f"Precomputed LoRA deltas for {len(deltas)} parameters")
+        return deltas
+
+    def _apply_lora_deltas(self) -> None:
+        params = dict(self.pipe.transformer.named_parameters())
+        for name, delta in self.lora_deltas.items():
+            params[name].data.add_(delta)
+
+    def _remove_lora_deltas(self) -> None:
+        params = dict(self.pipe.transformer.named_parameters())
+        for name, delta in self.lora_deltas.items():
+            params[name].data.sub_(delta)
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         video_latent, audio_latent = self.pipe(
@@ -116,6 +148,7 @@ class xFuserLTX2VideoModel(xFuserModel):
 
         video_latent = self.upsample_pipe(latents=video_latent, output_type="latent", return_dict=False)[0]
 
+        self._apply_lora_deltas()
         output = self.second_pipe(
             latents=video_latent,
             audio_latents=audio_latent,
@@ -128,16 +161,15 @@ class xFuserLTX2VideoModel(xFuserModel):
             output_type="np",
             generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
         )
+        self._remove_lora_deltas()
         return DiffusionOutput(videos=output, pipe_args=input_args)
 
     def _compile_model(self, input_args: dict) -> None:
         torch._inductor.config.reorder_for_compute_comm_overlap = True
         self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
-        self.second_pipe.transformer = torch.compile(self.second_pipe.transformer, mode="default")
 
-        # two steps to warmup the torch compiler
         compile_args = copy.deepcopy(input_args)
-        compile_args["num_inference_steps"] = 2  # Reduce steps for warmup # TODO: make this more generic
+        compile_args["num_inference_steps"] = 2
         self._run_timed_pipe(compile_args)
 
     def save_output(self, output: DiffusionOutput) -> None:
