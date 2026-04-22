@@ -33,6 +33,84 @@ DEFAULT_NEGATIVE_PROMPT = "" \
 "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, " \
 "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
 
+@register_model("dg845/LTX-2.3-Diffusers")
+@register_model("LTX-2.3")
+class xFuserLTX23VideoModel(xFuserModel):
+    default_input_values = DefaultInputValues(
+        height=1024,
+        width=1536,
+        num_frames=121,
+        num_inference_steps=40,
+        guidance_scale=4.0,
+        negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+    )
+
+    settings = ModelSettings(
+        model_name="dg845/LTX-2.3-Diffusers",
+        output_name="ltx_2_3_video",
+        model_output_type="video",
+        fps=24,
+        resolution_divisor=64,
+    )
+
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+    )
+
+    def _load_model(self) -> DiffusionPipeline:
+        transformer = xFuserLTX2VideoTransformer3DWrapper.from_pretrained(
+            self.settings.model_name,
+            torch_dtype=torch.bfloat16,
+            subfolder="transformer",
+        )
+
+        pipe = LTX2Pipeline.from_pretrained(
+            pretrained_model_name_or_path=self.settings.model_name,
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
+        )
+
+        return pipe
+
+    def _run_pipe(self, input_args: dict) -> DiffusionOutput:
+        output = self.pipe(
+            prompt=input_args["prompt"],
+            negative_prompt=input_args["negative_prompt"],
+            height=input_args["height"],
+            width=input_args["width"],
+            num_frames=input_args["num_frames"],
+            frame_rate=self.settings.fps,
+            num_inference_steps=input_args["num_inference_steps"],
+            guidance_scale=input_args["guidance_scale"],
+            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            output_type="np",
+            use_cross_timestep=True,
+        )
+
+        return DiffusionOutput(videos=output, pipe_args=input_args)
+
+    def _compile_model(self, input_args: dict) -> None:
+        torch._inductor.config.reorder_for_compute_comm_overlap = True
+        self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
+
+        # two steps to warmup the torch compiler
+        compile_args = copy.deepcopy(input_args)
+        compile_args["num_inference_steps"] = 2  # Reduce steps for warmup # TODO: make this more generic
+        self._run_timed_pipe(compile_args)
+
+    def save_output(self, output: DiffusionOutput) -> None:
+        pipe_args = output.pipe_args
+        output = output.videos
+        audio_sample_rate = self.pipe.vocoder.config.output_sampling_rate
+        for i, video_object in enumerate(output):
+            video, audio = video_object.frames, video_object.audio
+            video = (video * 255).round().astype("uint8")
+            video = torch.from_numpy(video)
+            output_name = self.get_output_name(pipe_args[i])
+            output_path = f"{self.config.output_directory}/{output_name}_{i}.mp4"
+            encode_video(video[0], audio=audio[0].float().cpu(), audio_sample_rate=audio_sample_rate, fps=self.settings.fps, output_path=output_path)
+            log(f"Output video saved to {output_path}")
 
 
 @register_model("Lightricks/LTX-2")

@@ -60,6 +60,9 @@ class xFuserLTX2AudioVideoAttnProcessor:
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
+        if attn.to_gate_logits is not None:
+            gate_logits = attn.to_gate_logits(hidden_states)
+
         query = attn.to_q(hidden_states)
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
@@ -91,9 +94,16 @@ class xFuserLTX2AudioVideoAttnProcessor:
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
+        if attn.to_gate_logits is not None:
+            hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            hidden_states = hidden_states * gates.unsqueeze(-1)
+            hidden_states = hidden_states.flatten(2, 3)
+
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
+
 
 class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
 
@@ -110,6 +120,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         pos_embed_max_pos: int = 20,
         base_height: int = 2048,
         base_width: int = 2048,
+        gated_attn: bool = False,
+        cross_attn_mod: bool = False,
         audio_in_channels: int = 128,  # Audio Arguments
         audio_out_channels: Optional[int] = 128,
         audio_patch_size: int = 1,
@@ -121,6 +133,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         audio_pos_embed_max_pos: int = 20,
         audio_sampling_rate: int = 16000,
         audio_hop_length: int = 160,
+        audio_gated_attn: bool = False,
+        audio_cross_attn_mod: bool = False,
         num_layers: int = 48,  # Shared arguments
         activation_fn: str = "gelu-approximate",
         qk_norm: str = "rms_norm_across_heads",
@@ -135,6 +149,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         timestep_scale_multiplier: int = 1000,
         cross_attn_timestep_scale_multiplier: int = 1000,
         rope_type: str = "interleaved",
+        use_prompt_embeddings: bool = True,
+        perturbed_attn: bool = False,
     ):
         super().__init__(
             in_channels=in_channels,
@@ -148,6 +164,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             pos_embed_max_pos=pos_embed_max_pos,
             base_height=base_height,
             base_width=base_width,
+            gated_attn=gated_attn,
+            cross_attn_mod=cross_attn_mod,
             audio_in_channels=audio_in_channels,  # Audio Arguments
             audio_out_channels=audio_out_channels,
             audio_patch_size=audio_patch_size,
@@ -159,6 +177,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             audio_pos_embed_max_pos=audio_pos_embed_max_pos,
             audio_sampling_rate=audio_sampling_rate,
             audio_hop_length=audio_hop_length,
+            audio_gated_attn=audio_gated_attn,
+            audio_cross_attn_mod=audio_cross_attn_mod,
             num_layers=num_layers,  # Shared arguments
             activation_fn=activation_fn,
             qk_norm=qk_norm,
@@ -173,9 +193,10 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             timestep_scale_multiplier=timestep_scale_multiplier,
             cross_attn_timestep_scale_multiplier=cross_attn_timestep_scale_multiplier,
             rope_type=rope_type,
+            use_prompt_embeddings=use_prompt_embeddings,
+            perturbed_attn=perturbed_attn,
         )
         for block in self.transformer_blocks:
-
             block.attn1.processor = xFuserLTX2AudioVideoAttnProcessor()
             block.attn2.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
             block.audio_attn1.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
@@ -327,6 +348,7 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
 
         # Determine timestep for audio.
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma = audio_sigma if audio_sigma is not None else sigma
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
@@ -392,15 +414,32 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
 
         audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
 
+        if self.prompt_modulation:
+            # LTX-2.3
+            temb_prompt, _ = self.prompt_adaln(
+                sigma.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype
+            )
+            temb_prompt_audio, _ = self.audio_prompt_adaln(
+                audio_sigma.flatten(), batch_size=batch_size, hidden_dtype=audio_hidden_states.dtype
+            )
+            temb_prompt = temb_prompt.view(batch_size, -1, temb_prompt.size(-1))
+            temb_prompt_audio = temb_prompt_audio.view(batch_size, -1, temb_prompt_audio.size(-1))
+        else:
+            temb_prompt = temb_prompt_audio = None
+
         # 3.2. Prepare global modality cross attention modulation parameters
+        # LTX-2.3: use the cross-modality sigma (audio sigma for video CA, video sigma for audio CA)
+        video_ca_timestep = audio_sigma.flatten() if use_cross_timestep else timestep.flatten()
+        audio_ca_timestep = sigma.flatten() if use_cross_timestep else audio_timestep.flatten()
+
         video_cross_attn_scale_shift, _ = self.av_cross_attn_video_scale_shift(
-            timestep.flatten(),
+            video_ca_timestep,
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
 
         video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
-            timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            video_ca_timestep * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
@@ -410,12 +449,12 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.view(batch_size, -1, video_cross_attn_a2v_gate.shape[-1])
 
         audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
-            audio_timestep.flatten(),
+            audio_ca_timestep,
             batch_size=batch_size,
             hidden_dtype=audio_hidden_states.dtype,
         )
         audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
-            audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            audio_ca_timestep * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=audio_hidden_states.dtype,
         )
@@ -424,12 +463,13 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
         )
         audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
 
-        # 4. Prepare prompt embeddings
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+        # 4. Prepare prompt embeddings (LTX-2.0)
+        if self.config.use_prompt_embeddings:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
-        audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
-        audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
+            audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
+            audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
         # 5. Run transformer blocks
 
@@ -447,6 +487,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     audio_cross_attn_scale_shift,
                     video_cross_attn_a2v_gate,
                     audio_cross_attn_v2a_gate,
+                    temb_prompt,
+                    temb_prompt_audio,
                     video_rotary_emb,
                     audio_rotary_emb,
                     video_cross_attn_rotary_emb,
@@ -466,6 +508,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     temb_ca_audio_scale_shift=audio_cross_attn_scale_shift,
                     temb_ca_gate=video_cross_attn_a2v_gate,
                     temb_ca_audio_gate=audio_cross_attn_v2a_gate,
+                    temb_prompt=temb_prompt,
+                    temb_prompt_audio=temb_prompt_audio,
                     video_rotary_emb=video_rotary_emb,
                     audio_rotary_emb=audio_rotary_emb,
                     ca_video_rotary_emb=video_cross_attn_rotary_emb,
