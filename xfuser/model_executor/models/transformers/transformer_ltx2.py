@@ -613,6 +613,12 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     audio_cross_attn_rotary_emb,
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
+                    None,  # self_attention_mask
+                    None,  # audio_self_attention_mask
+                    None,  # a2v_cross_attention_mask
+                    None,  # v2a_cross_attention_mask
+                    not isolate_modalities,  # use_a2v_cross_attention
+                    not isolate_modalities,  # use_v2a_cross_attention
                     block_perturbation_mask,
                     block_all_perturbed,
                 )
@@ -636,6 +642,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     ca_audio_rotary_emb=audio_cross_attn_rotary_emb,
                     encoder_attention_mask=encoder_attention_mask,
                     audio_encoder_attention_mask=audio_encoder_attention_mask,
+                    use_a2v_cross_attention=not isolate_modalities,
+                    use_v2a_cross_attention=not isolate_modalities,
                     perturbation_mask=block_perturbation_mask,
                     all_perturbed=block_all_perturbed,
                 )
