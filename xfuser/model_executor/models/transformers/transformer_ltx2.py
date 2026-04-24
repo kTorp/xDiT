@@ -26,6 +26,105 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 
+
+class xFuserLTX2PerturbedAttnProcessor:
+
+    def __init__(self, use_parallel_attention: bool = True, gather_kv=False):
+        if use_parallel_attention:
+            self.attention_method = USP
+        else:
+            self.attention_method = attention
+        self.gather_kv = gather_kv
+
+    def __call__(
+        self,
+        attn: "LTX2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        perturbation_mask: Optional[torch.Tensor] = None,
+        all_perturbed: Optional[bool] = None,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        # ------------------------------------------------------------ Same
+        if self.gather_kv:
+            encoder_hidden_states = get_sp_group().all_gather(encoder_hidden_states, dim=1)
+            key_rotary_emb = [x.contiguous() for x in key_rotary_emb]
+            key_rotary_emb = [get_sp_group().all_gather(x, dim=2) for x in key_rotary_emb]
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        if attn.to_gate_logits is not None:
+            gate_logits = attn.to_gate_logits(hidden_states)
+        # ------------------------------------------------------------
+        value = attn.to_v(encoder_hidden_states)
+        if all_perturbed is None:
+            all_perturbed = torch.all(perturbation_mask == 0) if perturbation_mask is not None else False
+
+        if all_perturbed:
+            # Skip attention, use the value projection value
+            hidden_states = value
+        else:
+            # ------------------------------------------------------------ Same except gated in branch
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(encoder_hidden_states)
+
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
+
+            if query_rotary_emb is not None:
+                if attn.rope_type == "interleaved":
+                    query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+                    key = apply_interleaved_rotary_emb(
+                        key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
+                    )
+                elif attn.rope_type == "split":
+                    query = apply_split_rotary_emb(query, query_rotary_emb)
+                    key = apply_split_rotary_emb(key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb)
+            # ------------------------------------------------------------
+
+            # ------------------------------------------------------------ Same
+            query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+            hidden_states = self.attention_method(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+            hidden_states = hidden_states.to(query.dtype)
+            # ------------------------------------------------------------
+
+            if perturbation_mask is not None:
+                value = value.flatten(2, 3)
+                hidden_states = torch.lerp(value, hidden_states, perturbation_mask)           
+
+        # ------------------------------------------------------------ Same
+        if attn.to_gate_logits is not None:
+            hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            hidden_states = hidden_states * gates.unsqueeze(-1)
+            hidden_states = hidden_states.flatten(2, 3)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+        # ------------------------------------------------------------
+
+
 class xFuserLTX2AudioVideoAttnProcessor:
 
     def __init__(self, use_parallel_attention: bool = True, gather_kv=False):
@@ -196,13 +295,19 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             use_prompt_embeddings=use_prompt_embeddings,
             perturbed_attn=perturbed_attn,
         )
+
+        if perturbed_attn:
+            attn_processor_cls = xFuserLTX2PerturbedAttnProcessor
+        else:
+            attn_processor_cls = xFuserLTX2AudioVideoAttnProcessor
+
         for block in self.transformer_blocks:
-            block.attn1.processor = xFuserLTX2AudioVideoAttnProcessor()
-            block.attn2.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_attn1.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_attn2.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.audio_to_video_attn.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False)
-            block.video_to_audio_attn.processor = xFuserLTX2AudioVideoAttnProcessor(use_parallel_attention=False, gather_kv=True)
+            block.attn1.processor = attn_processor_cls()
+            block.attn2.processor = attn_processor_cls(use_parallel_attention=False)
+            block.audio_attn1.processor = attn_processor_cls(use_parallel_attention=False)
+            block.audio_attn2.processor = attn_processor_cls(use_parallel_attention=False)
+            block.audio_to_video_attn.processor = attn_processor_cls(use_parallel_attention=False)
+            block.video_to_audio_attn.processor = attn_processor_cls(use_parallel_attention=False, gather_kv=True)
 
 
     def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:
@@ -472,8 +577,19 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
         # 5. Run transformer blocks
+        spatio_temporal_guidance_blocks = spatio_temporal_guidance_blocks or []
+        if len(spatio_temporal_guidance_blocks) > 0 and perturbation_mask is None:
+            # If STG is being used and perturbation_mask is not supplied, default to perturbing all batch elements.
+            perturbation_mask = torch.zeros((batch_size,))
+        if perturbation_mask is not None and perturbation_mask.ndim == 1:
+            perturbation_mask = perturbation_mask[:, None, None]  # unsqueeze to 3D to broadcast with hidden_states
+        all_perturbed = torch.all(perturbation_mask == 0) if perturbation_mask is not None else False
+        stg_blocks = set(spatio_temporal_guidance_blocks)
 
         for block_i, block in enumerate(self.transformer_blocks):
+            block_perturbation_mask = perturbation_mask if block_i in stg_blocks else None
+            block_all_perturbed = all_perturbed if block_i in stg_blocks else False
+            
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -495,6 +611,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     audio_cross_attn_rotary_emb,
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
+                    block_perturbation_mask,
+                    block_all_perturbed,
                 )
             else:
                 hidden_states, audio_hidden_states = block(
@@ -516,6 +634,8 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
                     ca_audio_rotary_emb=audio_cross_attn_rotary_emb,
                     encoder_attention_mask=encoder_attention_mask,
                     audio_encoder_attention_mask=audio_encoder_attention_mask,
+                    perturbation_mask=block_perturbation_mask,
+                    all_perturbed=block_all_perturbed,
                 )
 
         # 6. Output layers (including unpatchification)
