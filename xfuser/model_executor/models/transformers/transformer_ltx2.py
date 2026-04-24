@@ -577,18 +577,20 @@ class xFuserLTX2VideoTransformer3DWrapper(LTX2VideoTransformer3DModel):
             audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
 
         # 5. Run transformer blocks
-        spatio_temporal_guidance_blocks = spatio_temporal_guidance_blocks or []
-        if len(spatio_temporal_guidance_blocks) > 0 and perturbation_mask is None:
-            # If STG is being used and perturbation_mask is not supplied, default to perturbing all batch elements.
-            perturbation_mask = torch.zeros((batch_size,))
-        if perturbation_mask is not None and perturbation_mask.ndim == 1:
-            perturbation_mask = perturbation_mask[:, None, None]  # unsqueeze to 3D to broadcast with hidden_states
-        all_perturbed = torch.all(perturbation_mask == 0) if perturbation_mask is not None else False
-        stg_blocks = set(spatio_temporal_guidance_blocks)
+        stg_blocks = set(spatio_temporal_guidance_blocks or [])
+        if stg_blocks and perturbation_mask is None:
+            default_all_perturbed = True
+        else:
+            default_all_perturbed = False
+            if perturbation_mask is not None and perturbation_mask.ndim == 1:
+                perturbation_mask = perturbation_mask[:, None, None]
 
         for block_i, block in enumerate(self.transformer_blocks):
-            block_perturbation_mask = perturbation_mask if block_i in stg_blocks else None
-            block_all_perturbed = all_perturbed if block_i in stg_blocks else False
+            is_stg_block = block_i in stg_blocks
+            block_all_perturbed = default_all_perturbed if is_stg_block else False
+            block_perturbation_mask = (
+                perturbation_mask if (is_stg_block and not default_all_perturbed) else None
+            )
             
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
